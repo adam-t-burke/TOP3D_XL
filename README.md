@@ -27,3 +27,7 @@ TOP3D_XL('./data/Femur.TopVoxel', 'GLOBAL', 0.4, 50, sqrt(3));
 Syntax 4:
 %% Run Porous Infill Optimization on the External Design Domain Provided in *.TopVoxel
 TOP3D_XL('./data/Femur.TopVoxel', 'LOCAL', 0.5, 300, sqrt(3), 6);
+
+## Additional Documentation
+
+* [GEMINI.md](GEMINI.md)
