@@ -3,7 +3,7 @@ module Utils
 using SparseArrays
 using LinearAlgebra
 
-export CartesianMesh, solving_mission_partition, common_recover_halfe_nod_mat, common_include_adjacent_elements
+export CartesianMesh, solving_mission_partition, common_recover_halfe_nod_mat, common_include_adjacent_elements, accumarray
 
 mutable struct CartesianMesh
     resX::Int
@@ -47,6 +47,14 @@ mutable struct CartesianMesh
     end
 end
 
+function accumarray(subs, val, sz)
+    A = zeros(eltype(val), sz...)
+    for i in 1:length(val)
+        A[subs[i]] += val[i]
+    end
+    return A
+end
+
 function solving_mission_partition(totalSize, blockSize)
     numBlocks = ceil(Int, totalSize / blockSize)
     blockIndex = ones(Int, numBlocks, 2)
@@ -69,7 +77,7 @@ function common_recover_halfe_nod_mat(eNodMatHalf)
     return eNodMat
 end
 
-function common_include_adjacent_elements(iEleList, mesh::CartesianMesh)
+function common_include_adjacent_elements(iEleList, mesh)
     iEleListMapBack = mesh.eleMapBack[iEleList]
 
     resX = mesh.resX

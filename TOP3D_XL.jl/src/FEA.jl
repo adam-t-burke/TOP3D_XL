@@ -3,8 +3,9 @@ module FEA
 using LinearAlgebra
 using SparseArrays
 using ..Utils
+using ..Solvers
 
-export fea_voxel_based_element_stiffness_matrix, fea_voxel_based_discretization, create_voxel_fea_model, fea_apply_boundary_condition, fea_setup_voxel_based
+export fea_voxel_based_element_stiffness_matrix, fea_voxel_based_discretization, create_voxel_fea_model, fea_apply_boundary_condition, fea_setup_voxel_based, adapt_bc_external_mdl, adapt_passive_elements_external_mdl
 
 function fea_voxel_based_element_stiffness_matrix(poisson_ratio, cell_size)
     nu = poisson_ratio
@@ -188,44 +189,235 @@ function fea_voxel_based_discretization(voxelizedVolume, coarsestResolutionContr
     return mesh
 end
 
-function create_voxel_fea_model(inputModel::BitArray{3}, coarsestResolutionControl)
-    nely, nelx, nelz = size(inputModel)
-    if nelx < 3 || nely < 3 || nelz < 3
-        error("Inappropriate Input Model!")
+function create_voxel_fea_model(inputModel, coarsestResolutionControl)
+    if typeof(inputModel) <: AbstractString
+        # Read from file
+        open(inputModel, "r") do f
+            lines = readlines(f)
+            line_idx = 1
+
+            # Read header
+            while !startswith(lines[line_idx], "Resolution:")
+                line_idx += 1
+            end
+            res_line = split(lines[line_idx])
+            nelx = parse(Int, res_line[2])
+            nely = parse(Int, res_line[3])
+            nelz = parse(Int, res_line[4])
+            line_idx += 1
+
+            # Read density values included flag
+            density_values_included = parse(Bool, split(lines[line_idx])[2])
+            line_idx += 2 # Skip "Solid_Voxels:" line
+
+            # Read solid voxels
+            num_solid_voxels = parse(Int, split(lines[line_idx])[2])
+            line_idx += 1
+            solid_voxels = zeros(Int, num_solid_voxels)
+            density_layout = zeros(num_solid_voxels)
+            for i in 1:num_solid_voxels
+                line = split(lines[line_idx])
+                solid_voxels[i] = parse(Int, line[1])
+                if density_values_included
+                    density_layout[i] = parse(Float64, line[2])
+                end
+                line_idx += 1
+            end
+
+            # Read passive elements
+            line_idx += 1 # Skip "Passive elements:" line
+            num_passive_elements = parse(Int, split(lines[line_idx])[2])
+            line_idx += 1
+            passive_elements = zeros(Int, num_passive_elements)
+            for i in 1:num_passive_elements
+                passive_elements[i] = parse(Int, lines[line_idx])
+                line_idx += 1
+            end
+
+            # Read fixations
+            line_idx += 1 # Skip "Fixations:" line
+            num_fixed_nodes = parse(Int, split(lines[line_idx])[2])
+            line_idx += 1
+            fixing_cond = zeros(Int, num_fixed_nodes, 4)
+            for i in 1:num_fixed_nodes
+                line = split(lines[line_idx])
+                fixing_cond[i, :] = [parse(Int, val) for val in line]
+                line_idx += 1
+            end
+
+            # Read loads
+            line_idx += 1 # Skip "Loads:" line
+            num_loaded_nodes = parse(Int, split(lines[line_idx])[2])
+            line_idx += 1
+            loading_cond = [zeros(Float64, num_loaded_nodes, 4)]
+            for i in 1:num_loaded_nodes
+                line = split(lines[line_idx])
+                loading_cond[1][i, :] = [parse(Float64, val) for val in line]
+                line_idx += 1
+            end
+
+            # Read additional loads
+            line_idx += 1 # Skip "Additional Loads:" line
+            num_additional_loads = parse(Int, split(lines[line_idx])[2])
+            line_idx += 1
+            for _ in 1:num_additional_loads
+                line_idx += 1 # Skip "Loads:" line
+                num_loaded_nodes = parse(Int, split(lines[line_idx])[2])
+                load_idx = parse(Int, split(lines[line_idx])[3])
+                line_idx += 1
+                new_load = zeros(Float64, num_loaded_nodes, 4)
+                for i in 1:num_loaded_nodes
+                    line = split(lines[line_idx])
+                    new_load[i, :] = [parse(Float64, val) for val in line]
+                    line_idx += 1
+                end
+                push!(loading_cond, new_load)
+            end
+
+            obj_weighting_list = ones(length(loading_cond)) / length(loading_cond)
+
+            voxelized_volume = falses(nelx * nely * nelz)
+            voxelized_volume[solid_voxels] .= true
+            voxelized_volume = reshape(voxelized_volume, nely, nelx, nelz)
+
+            mesh = fea_voxel_based_discretization(voxelized_volume, coarsestResolutionControl)
+
+            # Adapt boundary conditions and passive elements
+            if !isempty(fixing_cond)
+                fixing_cond = adapt_bc_external_mdl(fixing_cond, [mesh.resX + 1, mesh.resY + 1, mesh.resZ + 1], (nelx, nely, nelz))
+                fixing_cond[:, 1] = mesh.nodMapForward[fixing_cond[:, 1]]
+            end
+            if !isempty(loading_cond)
+                for ii in 1:length(loading_cond)
+                    iLoad = loading_cond[ii]
+                    iLoad = adapt_bc_external_mdl(iLoad, [mesh.resX + 1, mesh.resY + 1, mesh.resZ + 1], (nelx, nely, nelz))
+                    iLoad[:, 1] = mesh.nodMapForward[iLoad[:, 1]]
+                    loading_cond[ii] = iLoad
+                end
+            end
+            if !isempty(passive_elements)
+                passive_elements = adapt_passive_elements_external_mdl(passive_elements, [mesh.resX, mesh.resY, mesh.resZ], (nelx, nely, nelz))
+                passive_elements = mesh.eleMapForward[passive_elements]
+            end
+
+            meshHierarchy = [mesh]
+            F = spzeros(mesh.numDOFs, length(loading_cond))
+            for ii in 1:length(loading_cond)
+                iLoad = loading_cond[ii]
+                iFarr = spzeros(mesh.numNodes, 3)
+                iFarr[Int.(iLoad[:, 1]), :] = iLoad[:, 2:end]
+                F[:, ii] = vec(iFarr')
+            end
+
+            return meshHierarchy, F, passive_elements, density_layout, fixing_cond, loading_cond, obj_weighting_list
+        end
+
+    elseif typeof(inputModel) <: BitArray{3}
+        # Built-in Cuboid Design Domain for Testing
+        nely, nelx, nelz = size(inputModel)
+        if nelx < 3 || nely < 3 || nelz < 3
+            error("Inappropriate Input Model!")
+        end
+
+        mesh = fea_voxel_based_discretization(inputModel, coarsestResolutionControl)
+
+        # Apply Boundary Conditions
+        nodeVolume4ApplyingBC = zeros(Bool, mesh.resY + 1, mesh.resX + 1, mesh.resZ + 1)
+        nodeVolume4ApplyingBC[1:nely+1, 1, 1:nelz+1] .= true
+        fixingCond_nodes = findall(vec(nodeVolume4ApplyingBC))
+        fixingCond_nodes = mesh.nodMapForward[fixingCond_nodes]
+        fixingCond = hcat(fixingCond_nodes, ones(Int, length(fixingCond_nodes), 3))
+
+        optLoad = 4 # 1=Line Loads; 2=Face Loads; 3=Face Loads-B; 4=Face Loads-C
+        nodeVolume4ApplyingBC = zeros(Bool, mesh.resY + 1, mesh.resX + 1, mesh.resZ + 1)
+        if optLoad == 1
+            nodeVolume4ApplyingBC[1:nely+1, nelx+1, 1] .= true
+        elseif optLoad == 2
+            nodeVolume4ApplyingBC[round(Int, nely/3)*1:round(Int, nely/3)*2, nelx+1, round(Int, nelz/3)*1:round(Int, nelz/3)*2] .= true
+        elseif optLoad == 3
+            nodeVolume4ApplyingBC[1:nely+1, round(Int, nelx*11/12):nelx+1, 1] .= true
+        elseif optLoad == 4
+            nodeVolume4ApplyingBC[1:nely+1, nelx+1, 1:round(Int, nelz/6+1)] .= true
+        end
+
+        iLoad_nodes = findall(vec(nodeVolume4ApplyingBC))
+        iLoad_nodes = mesh.nodMapForward[iLoad_nodes]
+        loadingCond = [hcat(iLoad_nodes, zeros(length(iLoad_nodes), 2), -ones(length(iLoad_nodes)) / length(iLoad_nodes))]
+
+        objWeightingList = [1.0]
+        passiveElements = Int[]
+        densityLayout = []
+
+        meshHierarchy = [mesh]
+        F = spzeros(mesh.numDOFs, length(loadingCond))
+        for ii in 1:length(loadingCond)
+            iLoad = loadingCond[ii]
+            iFarr = spzeros(mesh.numNodes, 3)
+            iFarr[Int.(iLoad[:, 1]), :] = iLoad[:, 2:end]
+            F[:, ii] = vec(iFarr')
+        end
+
+        return meshHierarchy, F, passiveElements, densityLayout, fixingCond, loadingCond, objWeightingList
     end
-
-    mesh = fea_voxel_based_discretization(inputModel, coarsestResolutionControl)
-
-    # Apply Boundary Conditions
-    nodeVolume4ApplyingBC = zeros(Bool, mesh.resY + 1, mesh.resX + 1, mesh.resZ + 1)
-    nodeVolume4ApplyingBC[1:nely+1, 1, 1:nelz+1] .= true
-    fixingCond_nodes = findall(nodeVolume4ApplyingBC)
-    fixingCond_nodes = mesh.nodMapForward[fixingCond_nodes]
-    fixingCond = hcat(fixingCond_nodes, ones(Int, length(fixingCond_nodes), 3))
-
-    optLoad = 4 # 1=Line Loads; 2=Face Loads; 3=Face Loads-B; 4=Face Loads-C
-    nodeVolume4ApplyingBC = zeros(Bool, mesh.resY + 1, mesh.resX + 1, mesh.resZ + 1)
-    if optLoad == 1
-        nodeVolume4ApplyingBC[1:nely+1, nelx+1, 1] .= true
-    elseif optLoad == 2
-        nodeVolume4ApplyingBC[round(Int, nely/3)*1:round(Int, nely/3)*2, nelx+1, round(Int, nelz/3)*1:round(Int, nelz/3)*2] .= true
-    elseif optLoad == 3
-        nodeVolume4ApplyingBC[1:nely+1, round(Int, nelx*11/12):nelx+1, 1] .= true
-    elseif optLoad == 4
-        nodeVolume4ApplyingBC[1:nely+1, nelx+1, 1:round(Int, nelz/6+1)] .= true
-    end
-
-    iLoad_nodes = findall(nodeVolume4ApplyingBC)
-    iLoad_nodes = mesh.nodMapForward[iLoad_nodes]
-    loadingCond = [hcat(iLoad_nodes, zeros(length(iLoad_nodes), 2), -ones(length(iLoad_nodes)) / length(iLoad_nodes))]
-
-    objWeightingList = [1.0]
-    passiveElements = Int[]
-
-    return mesh, fixingCond, loadingCond, objWeightingList, passiveElements
 end
 
-function fea_apply_boundary_condition(mesh::CartesianMesh, loadingCond, fixingCond)
+function adapt_bc_external_mdl(srcBC, adjustedRes, original_res)
+    nelx, nely, nelz = original_res
+    nullNodeVolume = zeros((nelx + 1) * (nely + 1) * (nelz + 1))
+
+    adjustedNnlx = adjustedRes[1]
+    adjustedNnly = adjustedRes[2]
+    adjustedNnlz = adjustedRes[3]
+    nnlx = nelx + 1
+    nnly = nely + 1
+    nnlz = nelz + 1
+
+    tmpBC = zeros(size(srcBC))
+    srcBC = srcBC[sortperm(srcBC[:, 1]), :]
+    nodeVolume = nullNodeVolume
+    nodeVolume[srcBC[:, 1]] .= 1
+    nodeVolume = reshape(nodeVolume, nely + 1, nelx + 1, nelz + 1)
+    nodeVolume = cat(nodeVolume, zeros(nnly, adjustedNnlx - nnlx, nnlz), dims=2)
+    nodeVolume = cat(nodeVolume, zeros(adjustedNnly - nnly, adjustedNnlx, nnlz), dims=1)
+    nodeVolume = cat(nodeVolume, zeros(adjustedNnly, adjustedNnlx, adjustedNnlz - nnlz), dims=3)
+    newLoadedNodes = findall(nodeVolume)
+    tmpBC[:, 1] = newLoadedNodes
+
+    for i in 2:4
+        nodeVolume = nullNodeVolume
+        nodeVolume[srcBC[:, 1]] = srcBC[:, i]
+        nodeVolume = reshape(nodeVolume, nely + 1, nelx + 1, nelz + 1)
+        nodeVolume = cat(nodeVolume, zeros(nnly, adjustedNnlx - nnlx, nnlz), dims=2)
+        nodeVolume = cat(nodeVolume, zeros(adjustedNnly - nnly, adjustedNnlx, nnlz), dims=1)
+        nodeVolume = cat(nodeVolume, zeros(adjustedNnly, adjustedNnlx, adjustedNnlz - nnlz), dims=3)
+        nodeVolume = vec(nodeVolume)
+        tmpBC[:, i] = nodeVolume[newLoadedNodes]
+    end
+
+    return tmpBC
+end
+
+function adapt_passive_elements_external_mdl(srcElesMapback, adjustedRes, original_res)
+    nelx, nely, nelz = original_res
+    nullVoxelVolume = zeros(nelx * nely * nelz)
+
+    adjustedNelx = adjustedRes[1]
+    adjustedNely = adjustedRes[2]
+    adjustedNelz = adjustedRes[3]
+
+    srcElesMapback = sort(srcElesMapback)
+    voxelVolume = nullVoxelVolume
+    voxelVolume[srcElesMapback] .= 1
+    voxelVolume = reshape(voxelVolume, nely, nelx, nelz)
+    voxelVolume = cat(voxelVolume, zeros(nely, adjustedNelx - nelx, nelz), dims=2)
+    voxelVolume = cat(voxelVolume, zeros(adjustedNely - nely, adjustedNelx, nelz), dims=1)
+    voxelVolume = cat(voxelVolume, zeros(adjustedNely, adjustedNelx, adjustedNelz - nnlz), dims=3)
+    adjustedVoxelIndices = findall(voxelVolume)
+
+    return adjustedVoxelIndices
+end
+
+function fea_apply_boundary_condition(meshHierarchy, loadingCond, fixingCond)
     # Pre-Check
     for ii in 1:length(loadingCond)
         iLoad = loadingCond[ii]
@@ -244,11 +436,11 @@ function fea_apply_boundary_condition(mesh::CartesianMesh, loadingCond, fixingCo
     end
 
     # Loading
-    F = spzeros(mesh.numDOFs, length(loadingCond))
+    F = spzeros(meshHierarchy[1].numDOFs, length(loadingCond))
     for ii in 1:length(loadingCond)
         iLoad = loadingCond[ii]
-        iFarr = spzeros(mesh.numNodes, 3)
-        iFarr[iLoad[:, 1], :] = iLoad[:, 2:end]
+        iFarr = spzeros(meshHierarchy[1].numNodes, 3)
+        iFarr[Int.(iLoad[:, 1]), :] = iLoad[:, 2:end]
         F[:, ii] = vec(iFarr')
     end
 
@@ -259,26 +451,27 @@ function fea_apply_boundary_condition(mesh::CartesianMesh, loadingCond, fixingCo
     fixingState = fixingCond[:, 2:end]'
     fixedDOFs = fixedDOFs[vec(fixingState) .== 1]
 
-    freeDOFs = trues(mesh.numDOFs)
+    freeDOFs = trues(meshHierarchy[1].numDOFs)
     freeDOFs[fixedDOFs] .= false
-    mesh.freeDOFs = freeDOFs
+    meshHierarchy[1].freeDOFs = freeDOFs
 
-    mesh.fixedDOFs = falses(mesh.numDOFs)
-    mesh.fixedDOFs[fixedDOFs] .= true
+    meshHierarchy[1].fixedDOFs = falses(meshHierarchy[1].numDOFs)
+    meshHierarchy[1].fixedDOFs[fixedDOFs] .= true
 
-    return mesh, F, loadingCond, fixingCond
+    return meshHierarchy, F, loadingCond, fixingCond
 end
 
-function fea_setup_voxel_based(mesh::CartesianMesh, poisson_ratio, cell_size)
-    mesh.Ke = fea_voxel_based_element_stiffness_matrix(poisson_ratio, cell_size)
+function fea_setup_voxel_based(meshHierarchy, poisson_ratio, cell_size, fixingCond, modulus)
+    meshHierarchy[1].Ke = fea_voxel_based_element_stiffness_matrix(poisson_ratio, cell_size)
 
-    # Placeholders for functions to be translated
-    # solving_building_mesh_hierarchy()
-    # solving_setup_ke_with_fixed_dofs()
+    meshHierarchy, _ = solving_building_mesh_hierarchy(meshHierarchy, numLevels_, nonDyadic_, eNodMatHalfTemp_)
 
-    mesh.Ks = mesh.Ke
+    meshHierarchy[1].Ks = meshHierarchy[1].Ke
 
-    return mesh
+    # Preparation to apply for BCs directly on element stiffness matrix
+    solving_setup_ke_with_fixed_dofs(meshHierarchy, fixingCond, modulus)
+
+    return meshHierarchy
 end
 
 end # module
